@@ -1,5 +1,9 @@
 import os
+import re
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
+from urllib.parse import urlparse
 
 import telebot
 from openai import OpenAI
@@ -15,17 +19,22 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL = "@marinadnews"
 ADMIN_ID = 6056292876
 
-# Московское время
 MSK = timezone(timedelta(hours=3))
 
-# Сколько часов реально разрешаем для финального отбора
-FINAL_NEWS_WINDOW_HOURS = 24
-
-# Сколько часов просим модель просматривать при поиске
+# Ищем шире
 SEARCH_WINDOW_HOURS = 48
 
-# Максимальный разумный запас на ошибку часов у источника/модели
+# Но в финальный TOP допускаем только свежие новости
+FINAL_NEWS_WINDOW_HOURS = 24
+
+# Допустимая погрешность времени
 FUTURE_TOLERANCE_MINUTES = 15
+
+# Минимальное количество кандидатов
+MIN_CANDIDATES = 3
+
+# Сколько новостей дополнительно проверяем
+MAX_VERIFICATION_CANDIDATES = 5
 
 
 # ============================================================
@@ -46,6 +55,34 @@ client = OpenAI(
 
 
 # ============================================================
+# РАЗРЕШЁННЫЕ ИСТОЧНИКИ
+# ============================================================
+
+TRUSTED_DOMAINS = {
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "bbc.co.uk",
+    "afp.com",
+    "tass.ru",
+    "ria.ru",
+    "interfax.ru",
+    "rg.ru",
+    "kremlin.ru",
+    "government.ru",
+    "mid.ru",
+    "mil.ru",
+    "mchs.gov.ru",
+    "mos.ru",
+    "lenta.ru",
+    "rbc.ru",
+    "kommersant.ru",
+    "vedomosti.ru",
+    "t.me",
+}
+
+
+# ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================
 
@@ -62,19 +99,21 @@ def format_msk(dt):
 
 
 def send_long_message(chat_id, text):
-    """
-    Telegram ограничивает длину одного сообщения.
-    Разбиваем длинный ответ на части.
-    """
     max_length = 4000
 
     if len(text) <= max_length:
-        bot.send_message(chat_id, text)
+        bot.send_message(
+            chat_id,
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
     parts = []
 
     while len(text) > max_length:
+
         split_at = text.rfind("\n", 0, max_length)
 
         if split_at == -1:
@@ -87,23 +126,29 @@ def send_long_message(chat_id, text):
         parts.append(text)
 
     for part in parts:
-        bot.send_message(chat_id, part)
+        bot.send_message(
+            chat_id,
+            part,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
 
 
 def parse_iso_datetime(value):
-    """
-    Безопасно превращает ISO дату модели в datetime.
-    """
     if not value:
         return None
 
     value = value.strip()
 
     try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        )
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
         return dt.astimezone(MSK)
 
@@ -111,59 +156,206 @@ def parse_iso_datetime(value):
         return None
 
 
-def validate_news_date(publication_dt, event_dt, current_time):
-    """
-    ЖЁСТКАЯ ПРОГРАММНАЯ ПРОВЕРКА.
+# ============================================================
+# ПРОВЕРКА ДАТЫ
+# ============================================================
 
-    Новости:
-    - не могут быть из будущего;
-    - публикация должна быть не старше 24 часов;
-    - событие не должно быть существенно старше 48 часов.
-    """
+def validate_news_date(
+    publication_dt,
+    event_dt,
+    current_time
+):
 
     if publication_dt is None:
-        return False, "нет корректной даты публикации"
+        return False, "нет даты публикации"
 
     future_limit = current_time + timedelta(
         minutes=FUTURE_TOLERANCE_MINUTES
     )
 
-    # Защита от будущих дат
     if publication_dt > future_limit:
         return False, "дата публикации в будущем"
 
     if event_dt and event_dt > future_limit:
         return False, "дата события в будущем"
 
-    publication_age = current_time - publication_dt
+    publication_age = (
+        current_time - publication_dt
+    )
 
-    # Публикация старше 24 часов
-    if publication_age > timedelta(hours=FINAL_NEWS_WINDOW_HOURS):
+    if publication_age > timedelta(
+        hours=FINAL_NEWS_WINDOW_HOURS
+    ):
         return False, "публикация старше 24 часов"
 
-    # Событие не должно быть слишком старым
     if event_dt:
-        event_age = current_time - event_dt
 
-        if event_age > timedelta(hours=SEARCH_WINDOW_HOURS):
-            return False, "само событие старше 48 часов"
+        event_age = (
+            current_time - event_dt
+        )
+
+        if event_age > timedelta(
+            hours=SEARCH_WINDOW_HOURS
+        ):
+            return False, "событие старше 48 часов"
 
     return True, "OK"
+
+
+# ============================================================
+# ПРОВЕРКА РУССКОГО ЗАГОЛОВКА
+# ============================================================
+
+def is_russian_title(title):
+    """
+    Проверяем, что заголовок действительно русский.
+    """
+
+    if not title:
+        return False
+
+    cyrillic = len(
+        re.findall(
+            r"[А-Яа-яЁё]",
+            title
+        )
+    )
+
+    latin = len(
+        re.findall(
+            r"[A-Za-z]",
+            title
+        )
+    )
+
+    total_letters = cyrillic + latin
+
+    if total_letters == 0:
+        return False
+
+    # Если кириллицы меньше 50%,
+    # считаем заголовок не русским.
+    if cyrillic / total_letters < 0.5:
+        return False
+
+    return True
+
+
+# ============================================================
+# ПРОВЕРКА URL
+# ============================================================
+
+def get_domain(url):
+    try:
+        parsed = urlparse(url)
+
+        domain = parsed.netloc.lower()
+
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        return domain
+
+    except Exception:
+        return ""
+
+
+def is_trusted_domain(url):
+    domain = get_domain(url)
+
+    if not domain:
+        return False
+
+    for trusted in TRUSTED_DOMAINS:
+
+        if domain == trusted:
+            return True
+
+        if domain.endswith("." + trusted):
+            return True
+
+    return False
+
+
+def check_url(url):
+    """
+    Проверяем:
+    1. корректность URL;
+    2. HTTPS;
+    3. домен;
+    4. доступность страницы.
+
+    Некоторые СМИ могут отвечать 403/405 на автоматические запросы.
+    Это не обязательно означает, что ссылка фальшивая.
+    """
+
+    if not url:
+        return False, "пустой URL"
+
+    if not url.startswith("https://"):
+        return False, "не HTTPS"
+
+    parsed = urlparse(url)
+
+    if not parsed.netloc:
+        return False, "некорректный URL"
+
+    domain = get_domain(url)
+
+    if not is_trusted_domain(url):
+        return False, f"неразрешённый источник: {domain}"
+
+    try:
+
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(compatible; MARINAD-NewsBot/1.0)"
+                )
+            },
+            method="HEAD"
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=8
+        ) as response:
+
+            status = response.status
+
+            if 200 <= status < 400:
+                return True, "OK"
+
+            if status in (401, 403, 405, 429):
+                return True, f"сервер доступен, HTTP {status}"
+
+            return False, f"HTTP {status}"
+
+    except urllib.error.HTTPError as e:
+
+        if e.code in (401, 403, 405, 429):
+            return True, f"сервер доступен, HTTP {e.code}"
+
+        return False, f"HTTP {e.code}"
+
+    except Exception as e:
+
+        # Сетевой таймаут не доказывает,
+        # что URL фальшивый.
+        # Но для неизвестного источника мы его отбрасываем.
+        return False, "страница недоступна"
 
 
 # ============================================================
 # ПАРСИНГ НОВОСТЕЙ
 # ============================================================
 
-def parse_news_candidates(raw_text, current_time):
-    """
-    Модель обязана отдавать новости в машинно-читаемом формате:
-
-    NEWS|Заголовок|publication_iso|event_iso|source|url|freshness|importance|interest|reliability
-
-    После получения мы НЕ доверяем модели на слово,
-    а программно проверяем даты.
-    """
+def parse_news_candidates(
+    raw_text,
+    current_time
+):
 
     candidates = []
 
@@ -183,12 +375,15 @@ def parse_news_candidates(raw_text, current_time):
             continue
 
         title = parts[1].strip()
+
         publication_raw = parts[2].strip()
         event_raw = parts[3].strip()
+
         source = parts[4].strip()
         url = parts[5].strip()
 
         try:
+
             freshness = int(parts[6].strip())
             importance = int(parts[7].strip())
             interest = int(parts[8].strip())
@@ -197,248 +392,249 @@ def parse_news_candidates(raw_text, current_time):
         except Exception:
             continue
 
-        publication_dt = parse_iso_datetime(publication_raw)
-        event_dt = parse_iso_datetime(event_raw)
+        publication_dt = parse_iso_datetime(
+            publication_raw
+        )
+
+        event_dt = parse_iso_datetime(
+            event_raw
+        )
+
+        # ----------------------------------------------------
+        # ПРОВЕРКА ДАТ
+        # ----------------------------------------------------
 
         valid, reason = validate_news_date(
             publication_dt,
             event_dt,
-            current_time,
+            current_time
         )
 
         if not valid:
             continue
 
-        # Нормализуем оценки
-        freshness = max(0, min(10, freshness))
-        importance = max(0, min(10, importance))
-        interest = max(0, min(10, interest))
-        reliability = max(0, min(10, reliability))
+        # ----------------------------------------------------
+        # ПРОВЕРКА ЗАГОЛОВКА
+        # ----------------------------------------------------
 
-        # Чем свежее новость, тем выше бонус.
+        if not is_russian_title(title):
+            continue
+
+        # ----------------------------------------------------
+        # ПРОВЕРКА URL
+        # ----------------------------------------------------
+
+        url_valid, url_reason = check_url(url)
+
+        if not url_valid:
+            continue
+
+        freshness = max(
+            0,
+            min(10, freshness)
+        )
+
+        importance = max(
+            0,
+            min(10, importance)
+        )
+
+        interest = max(
+            0,
+            min(10, interest)
+        )
+
+        reliability = max(
+            0,
+            min(10, reliability)
+        )
+
+        # ----------------------------------------------------
+        # РЕАЛЬНАЯ СВЕЖЕСТЬ
+        # ----------------------------------------------------
+
         age_hours = (
             current_time - publication_dt
         ).total_seconds() / 3600
 
-        freshness_bonus = max(
-            0,
-            10 - int(age_hours / 2)
-        )
+        # Бонус за реальную свежесть
+        if age_hours <= 2:
+            real_freshness_bonus = 10
 
-        # Итоговый редакционный балл.
+        elif age_hours <= 4:
+            real_freshness_bonus = 9
+
+        elif age_hours <= 8:
+            real_freshness_bonus = 8
+
+        elif age_hours <= 12:
+            real_freshness_bonus = 7
+
+        elif age_hours <= 18:
+            real_freshness_bonus = 6
+
+        else:
+            real_freshness_bonus = 4
+
+        # ----------------------------------------------------
+        # БАЗОВЫЙ РЕДАКЦИОННЫЙ БАЛЛ
+        # ----------------------------------------------------
+
         score = (
-            freshness * 0.30
+            freshness * 0.20
             + importance * 0.25
             + interest * 0.20
             + reliability * 0.20
-            + freshness_bonus * 0.05
+            + real_freshness_bonus * 0.15
         )
 
         candidates.append({
+
             "title": title,
+
             "publication": publication_dt,
+
             "event": event_dt,
+
             "source": source,
+
             "url": url,
+
             "freshness": freshness,
+
             "importance": importance,
+
             "interest": interest,
+
             "reliability": reliability,
+
             "score": round(score, 2),
+
+            "verified": False,
+
+            "verification_score": 0,
+
+            "secondary_source": "",
+
         })
 
     return candidates
 
 
+# ============================================================
+# УДАЛЕНИЕ ДУБЛИКАТОВ
+# ============================================================
+
+def normalize_title(title):
+
+    normalized = title.lower()
+
+    normalized = re.sub(
+        r"[^а-яa-z0-9 ]",
+        " ",
+        normalized
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized
+    )
+
+    return normalized.strip()
+
+
 def remove_duplicates(candidates):
-    """
-    Простая защита от повторов в одной выдаче.
-    """
 
     result = []
-    seen_titles = set()
+    seen = set()
 
     for item in candidates:
 
-        normalized = (
+        key = normalize_title(
             item["title"]
-            .lower()
-            .replace("«", "")
-            .replace("»", "")
-            .replace('"', "")
         )
 
-        # Берём первые 100 символов,
-        # чтобы ловить практически одинаковые заголовки.
-        key = normalized[:100]
-
-        if key in seen_titles:
+        if key in seen:
             continue
 
-        seen_titles.add(key)
+        seen.add(key)
         result.append(item)
 
     return result
 
 
+# ============================================================
+# СОРТИРОВКА
+# ============================================================
+
 def sort_candidates(candidates):
-    """
-    Сначала самые сильные и свежие новости.
-    """
 
     return sorted(
         candidates,
         key=lambda x: (
             x["score"],
-            x["publication"],
+            x["publication"]
         ),
-        reverse=True,
+        reverse=True
     )
 
 
 # ============================================================
-# ПОИСК НОВОСТЕЙ
+# ВТОРИЧНАЯ ПРОВЕРКА НОВОСТИ
 # ============================================================
 
-def search_news(topic=None):
-    current_time = now_msk()
-
-    if topic:
-        directions = f"""
-ОСНОВНАЯ ТЕМА ПОИСКА:
-{topic}
-
-Ищи новости именно по этой теме, но выбирай только реально значимые
-и актуальные события.
-"""
-    else:
-        directions = """
-ОБЯЗАТЕЛЬНО ПРОВЕРЬ НЕСКОЛЬКО НАПРАВЛЕНИЙ:
-
-1. Россия
-2. Мир
-3. Политика
-4. Конфликты / военная и международная безопасность
-5. Крупные происшествия
-6. Экономика / крупный бизнес
-7. Технологии / наука / общество
-
-Не обязательно брать новости из каждой категории.
-Нужно найти самые сильные события независимо от категории.
-"""
+def verify_candidate(candidate):
 
     prompt = f"""
-Ты работаешь как редактор новостного Telegram-канала «МАРИНАД».
+Ты — фактчекер Telegram-канала МАРИНАД.
 
-Текущая дата и время:
-{current_time.isoformat()}
+Нужно проверить конкретную новость.
 
-Московское время:
-{current_time.strftime("%d.%m.%Y %H:%M")} МСК
+ЗАГОЛОВОК:
+{candidate["title"]}
 
-ТВОЯ ЗАДАЧА:
-Найти самые сильные новости для публикации в Telegram.
+ИСТОЧНИК:
+{candidate["source"]}
 
-ПЕРИОД ПОИСКА:
-Последние {SEARCH_WINDOW_HOURS} часов.
+URL:
+{candidate["url"]}
 
-КРИТИЧЕСКИ ВАЖНО:
-
-Мы НЕ хотим старые новости.
-
-Дата публикации каждой новости ОБЯЗАТЕЛЬНО должна быть указана
-в ISO-формате с часовым поясом.
-
-Дата события тоже должна быть указана, если она известна.
-
-Не выдавай новость, если:
-- она опубликована больше 24 часов назад;
-- она относится к событию старше 48 часов;
-- дата неизвестна;
-- дата выглядит сомнительно;
-- дата находится в будущем;
-- это просто старый материал, который снова всплыл в поиске.
-
-Если старое событие получило НОВОЕ РАЗВИТИЕ сегодня,
-можно использовать именно новое развитие.
-В таком случае publication_iso должна соответствовать новой публикации.
-
-ПРИОРИТЕТ:
-1. Новости последних нескольких часов.
-2. Крупные события сегодняшнего дня.
-3. Новые развития важных событий.
-4. Международные и российские события с высоким общественным интересом.
-5. Происшествия с большим масштабом.
-6. Экономика и технологии, если событие действительно значимое.
-
-ИСТОЧНИКИ:
-Предпочитай:
-- Reuters
-- Associated Press
-- BBC
-- AFP
-- TASS
-- РИА Новости
-- Интерфакс
-- официальные государственные источники
-- официальные заявления организаций
-- крупные международные СМИ
-
-Не используй сомнительные сайты как единственное подтверждение
-для важных новостей.
-
-НЕ ПРИДУМЫВАЙ:
-- даты;
-- цифры;
-- погибших;
-- заявления;
-- источники;
-- ссылки.
-
-Если информацию невозможно надёжно подтвердить,
-лучше не включай её.
-
-{directions}
-
-НАЙДИ НЕ МЕНЕЕ 8 КАНДИДАТОВ, ЕСЛИ В ПОИСКЕ ЕСТЬ ДОСТАТОЧНО
-СВЕЖИХ НОВОСТЕЙ.
-
-Для каждой новости оцени:
-
-freshness = свежесть от 0 до 10
-importance = важность от 0 до 10
-interest = интерес для аудитории от 0 до 10
-reliability = надёжность от 0 до 10
-
-ОСОБО:
-Не ставь высокий reliability, если новость подтверждена только
-одним сомнительным источником.
-
-ФОРМАТ ОТВЕТА:
-
-Только строки следующего формата.
-Без нумерации.
-Без Markdown.
-Без пояснений.
-Без дополнительных строк.
-
-NEWS|ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|freshness|importance|interest|reliability
-
-Пример формата:
-
-NEWS|В Москве произошло крупное событие|2026-10-08T12:30:00+03:00|2026-10-08T11:50:00+03:00|Reuters|https://example.com|9|8|9|10
+Найди эту публикацию через browser search.
 
 ВАЖНО:
-Сейчас {current_time.strftime("%d.%m.%Y %H:%M")} МСК.
-Не путай дату публикации статьи с датой события.
+1. Проверь, существует ли реально указанная публикация.
+2. Проверь, соответствует ли содержание публикации заголовку.
+3. Проверь дату публикации.
+4. Найди независимое подтверждение этой же новости,
+   желательно у другого крупного СМИ или официального источника.
+5. Не считай перепечатки одного агентства независимыми источниками.
+
+ОТВЕТ ДОЛЖЕН БЫТЬ СТРОГО В ФОРМАТЕ:
+
+VERIFY|YES|secondary_source|secondary_url|reason
+
+или
+
+VERIFY|NO|NONE|NONE|reason
+
+Никаких дополнительных строк.
+
+Не придумывай URL.
+Если независимого подтверждения нет,
+это не обязательно означает, что новость ложная,
+но укажи VERIFY|NO.
 """
 
     try:
+
         response = client.responses.create(
             model="openai/gpt-oss-120b",
             input=prompt,
             tools=[
-                {"type": "browser_search"}
+                {
+                    "type": "browser_search"
+                }
             ],
             tool_choice="required",
             reasoning={
@@ -446,36 +642,87 @@ NEWS|В Москве произошло крупное событие|2026-10-08
             },
         )
 
-        return response.output_text.strip()
+        result = response.output_text.strip()
+
+        for line in result.splitlines():
+
+            line = line.strip()
+
+            if not line.startswith("VERIFY|"):
+                continue
+
+            parts = line.split("|")
+
+            if len(parts) < 5:
+                continue
+
+            decision = parts[1].strip().upper()
+
+            secondary_source = parts[2].strip()
+
+            secondary_url = parts[3].strip()
+
+            reason = "|".join(
+                parts[4:]
+            ).strip()
+
+            if decision == "YES":
+
+                return {
+                    "verified": True,
+                    "secondary_source": secondary_source,
+                    "secondary_url": secondary_url,
+                    "reason": reason,
+                }
+
+            return {
+                "verified": False,
+                "secondary_source": "",
+                "secondary_url": "",
+                "reason": reason,
+            }
 
     except Exception as e:
-        return f"ERROR|{str(e)}"
+
+        return {
+            "verified": False,
+            "secondary_source": "",
+            "secondary_url": "",
+            "reason": str(e),
+        }
+
+    return {
+        "verified": False,
+        "secondary_source": "",
+        "secondary_url": "",
+        "reason": "не удалось получить проверку",
+    }
 
 
 # ============================================================
-# ВТОРОЙ ПОИСК
+# ДОПОЛНИТЕЛЬНЫЙ ПОИСК
 # ============================================================
 
 def search_news_second_pass(topic=None):
-    """
-    Второй поиск нужен, если первый дал мало валидных новостей.
-    """
 
     current_time = now_msk()
 
     if topic:
+
         search_direction = f"""
 ТЕМА:
 {topic}
 """
+
     else:
+
         search_direction = """
-Сделай дополнительный поиск по самым актуальным событиям:
+Ищи дополнительно по направлениям:
 
 Россия,
 мир,
-конфликты,
 политика,
+конфликты,
 происшествия,
 экономика,
 технологии,
@@ -483,49 +730,54 @@ def search_news_second_pass(topic=None):
 """
 
     prompt = f"""
-Ты — второй новостной редактор канала «МАРИНАД».
+Ты — второй новостной редактор канала МАРИНАД.
 
 Сейчас:
 {current_time.strftime("%d.%m.%Y %H:%M")} МСК.
 
-Нужны САМЫЕ СВЕЖИЕ события за последние 24 часа.
-
 {search_direction}
 
-Ищи дополнительно, а не повторяй очевидные старые материалы.
+Найди самые важные события последних 24 часов.
 
-Особенно ищи:
-- события сегодняшнего дня;
-- новости последних часов;
+ОСОБО ИЩИ:
+- новости сегодняшнего дня;
+- события последних часов;
 - новые официальные заявления;
-- новые последствия событий;
+- новые последствия крупных событий;
 - крупные происшествия;
-- новые решения властей;
-- новые международные события;
-- резонансные новости.
+- международные события;
+- экономические события;
+- технологии и науку.
 
-Не используй публикации старше 24 часов.
+Не используй публикации старше 24 часов,
+если это не новое развитие старого события.
 
-Старое событие допускается только если сегодня произошло
-новое существенное развитие.
+НУЖНЫ ТОЛЬКО РУССКИЕ ЗАГОЛОВКИ.
+
+Никаких английских headline.
 
 Нужны минимум 5 кандидатов.
 
-Формат каждой строки:
+Формат:
 
-NEWS|ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|freshness|importance|interest|reliability
+NEWS|РУССКИЙ ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|freshness|importance|interest|reliability
+
+Все даты должны быть реальными.
+
+Не придумывай URL.
 
 Никаких дополнительных пояснений.
-
-Не придумывай даты, источники и факты.
 """
 
     try:
+
         response = client.responses.create(
             model="openai/gpt-oss-120b",
             input=prompt,
             tools=[
-                {"type": "browser_search"}
+                {
+                    "type": "browser_search"
+                }
             ],
             tool_choice="required",
             reasoning={
@@ -536,6 +788,166 @@ NEWS|ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|freshness|importanc
         return response.output_text.strip()
 
     except Exception as e:
+
+        return f"ERROR|{str(e)}"
+
+
+# ============================================================
+# ОСНОВНОЙ ПОИСК
+# ============================================================
+
+def search_news(topic=None):
+
+    current_time = now_msk()
+
+    if topic:
+
+        directions = f"""
+ОСНОВНАЯ ТЕМА:
+
+{topic}
+
+Ищи именно эту тему.
+"""
+
+    else:
+
+        directions = """
+ПРОВЕРЬ НЕСКОЛЬКО НАПРАВЛЕНИЙ:
+
+1. Россия
+2. Мир
+3. Политика
+4. Конфликты / безопасность
+5. Происшествия
+6. Экономика / бизнес
+7. Технологии / наука / общество
+
+Не обязательно брать каждую категорию.
+Выбирай самые сильные события.
+"""
+
+    prompt = f"""
+Ты — главный редактор новостного Telegram-канала МАРИНАД.
+
+СЕЙЧАС:
+
+{current_time.strftime("%d.%m.%Y %H:%M")} МСК
+
+ПЕРИОД ПОИСКА:
+
+Последние {SEARCH_WINDOW_HOURS} часов.
+
+ФИНАЛЬНО ДОПУСКАЮТСЯ:
+
+Только новости, опубликованные за последние
+{FINAL_NEWS_WINDOW_HOURS} часов.
+
+{directions}
+
+ПРИОРИТЕТ:
+
+1. События последних часов.
+2. Крупные события сегодняшнего дня.
+3. Новые развития важных событий.
+4. Россия.
+5. Мир.
+6. Конфликты и безопасность.
+7. Крупные происшествия.
+8. Экономика.
+9. Технологии и наука.
+
+ИСТОЧНИКИ:
+
+Предпочитай:
+
+Reuters
+Associated Press
+BBC
+AFP
+ТАСС
+РИА Новости
+Интерфакс
+официальные государственные источники
+крупные СМИ.
+
+КРИТИЧЕСКИ ВАЖНО:
+
+ЗАГОЛОВОК ОБЯЗАТЕЛЬНО НА РУССКОМ ЯЗЫКЕ.
+
+Не пиши английские заголовки.
+
+Не копируй английский headline.
+
+Сформулируй нормальный русский редакционный заголовок
+для Telegram-канала.
+
+Не придумывай:
+
+- факты;
+- даты;
+- цифры;
+- погибших;
+- цитаты;
+- источники;
+- URL.
+
+URL должен быть РЕАЛЬНОЙ ссылкой на конкретную публикацию.
+
+Не используй главную страницу СМИ.
+
+Не создавай URL самостоятельно.
+
+Дата публикации должна соответствовать конкретной найденной статье.
+
+Дата события должна соответствовать самому событию.
+
+Если старое событие получило новое развитие,
+используй именно новую публикацию.
+
+Найди минимум 8 кандидатов, если это возможно.
+
+Оцени:
+
+freshness 0-10
+importance 0-10
+interest 0-10
+reliability 0-10
+
+ФОРМАТ:
+
+NEWS|РУССКИЙ ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|freshness|importance|interest|reliability
+
+ТОЛЬКО ЭТИ СТРОКИ.
+
+Без Markdown.
+Без нумерации.
+Без пояснений.
+
+Текущее время:
+{current_time.isoformat()}
+"""
+
+    try:
+
+        response = client.responses.create(
+            model="openai/gpt-oss-120b",
+            input=prompt,
+            tools=[
+                {
+                    "type": "browser_search"
+                }
+            ],
+            tool_choice="required",
+            reasoning={
+                "effort": "low"
+            },
+        )
+
+        return response.output_text.strip()
+
+    except Exception as e:
+
         return f"ERROR|{str(e)}"
 
 
@@ -547,16 +959,18 @@ NEWS|ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|freshness|importanc
 def start_command(message):
 
     if not is_admin(message):
+
         bot.reply_to(
             message,
             "⛔ Доступ запрещён."
         )
+
         return
 
     bot.reply_to(
         message,
         """
-🧂 МАРИНАД | NEWS BOT
+🧂 <b>МАРИНАД | NEWS BOT</b>
 
 Команды:
 
@@ -573,7 +987,8 @@ def start_command(message):
 
 /news ТЕМА
 Найти свежие новости по конкретной теме
-"""
+""",
+        parse_mode="HTML"
     )
 
 
@@ -586,7 +1001,8 @@ def myid_command(message):
 
     bot.reply_to(
         message,
-        f"🆔 Ваш Telegram ID:\n{message.from_user.id}"
+        f"🆔 <b>Ваш Telegram ID:</b>\n{message.from_user.id}",
+        parse_mode="HTML"
     )
 
 
@@ -598,10 +1014,12 @@ def myid_command(message):
 def publish_command(message):
 
     if not is_admin(message):
+
         bot.reply_to(
             message,
             "⛔ Доступ запрещён."
         )
+
         return
 
     text = message.text.replace(
@@ -611,17 +1029,20 @@ def publish_command(message):
     ).strip()
 
     if not text:
+
         bot.reply_to(
             message,
             "Использование:\n/publish ТЕКСТ"
         )
+
         return
 
     try:
 
         bot.send_message(
             CHANNEL,
-            text
+            text,
+            parse_mode="HTML"
         )
 
         bot.reply_to(
@@ -645,10 +1066,12 @@ def publish_command(message):
 def ai_command(message):
 
     if not is_admin(message):
+
         bot.reply_to(
             message,
             "⛔ Доступ запрещён."
         )
+
         return
 
     prompt = message.text.replace(
@@ -658,10 +1081,12 @@ def ai_command(message):
     ).strip()
 
     if not prompt:
+
         bot.reply_to(
             message,
             "Использование:\n/ai ТЕКСТ"
         )
+
         return
 
     status = bot.reply_to(
@@ -672,11 +1097,14 @@ def ai_command(message):
     try:
 
         response = client.responses.create(
+
             model="openai/gpt-oss-120b",
+
             instructions="""
-Ты — редактор Telegram-канала МАРИНАД.
+Ты — главный редактор Telegram-канала МАРИНАД.
 
 Стиль:
+
 - современный;
 - быстрый;
 - живой;
@@ -689,23 +1117,24 @@ def ai_command(message):
 - нельзя придумывать цифры;
 - нельзя придумывать источники.
 
-Формат:
-сильный заголовок
-+
-короткий содержательный текст.
+Заголовок должен быть на русском языке.
 
-Обычно 300–700 символов.
+Обычно пост:
+300–700 символов.
 
 Не добавляй:
+
 «СВЕДЕО»
 «Новости без лишнего шума»
 дату отдельной строкой.
 
 Слоган МАРИНАД:
+
 «Вся соль здесь».
 
-Не используй его в конце каждого поста автоматически.
+Не используй его автоматически в конце каждого поста.
 """,
+
             input=prompt,
         )
 
@@ -738,10 +1167,12 @@ def ai_command(message):
 def news_command(message):
 
     if not is_admin(message):
+
         bot.reply_to(
             message,
             "⛔ Доступ запрещён."
         )
+
         return
 
     topic = message.text.replace(
@@ -755,25 +1186,28 @@ def news_command(message):
     status = bot.reply_to(
         message,
         (
-            "🔎 Ищу свежие новости для МАРИНАД...\n\n"
+            "🔎 <b>Ищу свежие новости для МАРИНАД...</b>\n\n"
             f"🕐 Сейчас: {format_msk(current_time)} МСК\n"
             f"🔍 Поиск: последние {SEARCH_WINDOW_HOURS} часов\n"
-            f"✅ Финальный фильтр: последние {FINAL_NEWS_WINDOW_HOURS} часов"
-        )
+            f"🔒 Финальный фильтр: последние {FINAL_NEWS_WINDOW_HOURS} часов"
+        ),
+        parse_mode="HTML"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ПЕРВЫЙ ПОИСК
-    # --------------------------------------------------------
+    # ========================================================
 
     raw_first = search_news(topic)
 
     if raw_first.startswith("ERROR|"):
+
         bot.edit_message_text(
             "❌ Ошибка поиска:\n" + raw_first[6:],
             message.chat.id,
             status.message_id
         )
+
         return
 
     candidates = parse_news_candidates(
@@ -781,14 +1215,15 @@ def news_command(message):
         current_time
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # ВТОРОЙ ПОИСК
-    # Если валидных новостей мало
-    # --------------------------------------------------------
+    # ========================================================
 
-    if len(candidates) < 3:
+    if len(candidates) < MIN_CANDIDATES:
 
-        raw_second = search_news_second_pass(topic)
+        raw_second = search_news_second_pass(
+            topic
+        )
 
         if not raw_second.startswith("ERROR|"):
 
@@ -801,128 +1236,160 @@ def news_command(message):
                 second_candidates
             )
 
-    # --------------------------------------------------------
-    # УДАЛЯЕМ ПОВТОРЫ
-    # --------------------------------------------------------
+    # ========================================================
+    # УДАЛЯЕМ ДУБЛИКАТЫ
+    # ========================================================
 
     candidates = remove_duplicates(
         candidates
     )
 
-    # --------------------------------------------------------
-    # СОРТИРОВКА
-    # --------------------------------------------------------
+    # ========================================================
+    # СОРТИРУЕМ
+    # ========================================================
 
     candidates = sort_candidates(
         candidates
     )
 
-    # Берём максимум 3
-    top_news = candidates[:3]
+    # ========================================================
+    # ВТОРИЧНАЯ ПРОВЕРКА
+    # ========================================================
 
-    # --------------------------------------------------------
-    # ЕСЛИ НИЧЕГО НЕ НАЙДЕНО
-    # --------------------------------------------------------
+    verified_candidates = []
 
-    if not top_news:
+    for candidate in candidates[
+        :MAX_VERIFICATION_CANDIDATES
+    ]:
 
+        verification = verify_candidate(
+            candidate
+        )
+
+        if verification["verified"]:
+
+            candidate["verified"] = True
+
+            candidate["verification_score"] = 10
+
+            candidate["secondary_source"] = (
+                verification["secondary_source"]
+            )
+
+            candidate["secondary_url"] = (
+                verification["secondary_url"]
+            )
+
+            # Бонус за независимое подтверждение
+            candidate["score"] = round(
+                candidate["score"] + 0.45,
+                2
+            )
+
+            verified_candidates.append(
+                candidate
+            )
+
+    # ========================================================
+    # ЕСЛИ ВТОРИЧНАЯ ПРОВЕРКА НЕ НАШЛА НИЧЕГО
+    # ========================================================
+
+    if len(verified_candidates) == 0:
+
+        # Не показываем потенциально сомнительные новости.
         bot.edit_message_text(
             (
-                "⚠️ Свежих подтверждённых новостей "
-                "за последние 24 часа не найдено.\n\n"
-                "Старые публикации бот специально отфильтровал."
+                "⚠️ <b>Надёжных новостей не найдено.</b>\n\n"
+                "Поиск дал кандидатов, но они не прошли "
+                "вторичную проверку.\n\n"
+                "Старые и неподтверждённые материалы "
+                "бот не показывает."
             ),
             message.chat.id,
-            status.message_id
+            status.message_id,
+            parse_mode="HTML"
         )
 
         return
 
-    # --------------------------------------------------------
-    # ФОРМИРУЕМ ОТВЕТ
-    # --------------------------------------------------------
+    # ========================================================
+    # ФИНАЛЬНАЯ СОРТИРОВКА
+    # ========================================================
+
+    verified_candidates = sort_candidates(
+        verified_candidates
+    )
+
+    top_news = verified_candidates[:3]
+
+    # ========================================================
+    # ФОРМИРУЕМ КОМПАКТНЫЙ ОТВЕТ
+    # ========================================================
 
     output = []
 
     output.append(
-        "🧂 МАРИНАД | РЕДАКЦИОННЫЙ ОТБОР"
+        "🧂 <b>МАРИНАД | РЕДАКЦИОННЫЙ ОТБОР</b>"
     )
 
     output.append("")
 
     output.append(
-        f"🕐 Проверено: {format_msk(current_time)} МСК"
-    )
-
-    output.append(
-        f"📌 Поиск: последние {SEARCH_WINDOW_HOURS} часов"
-    )
-
-    output.append(
-        f"🔒 Финальный фильтр: последние {FINAL_NEWS_WINDOW_HOURS} часов"
+        f"🕐 {format_msk(current_time)} МСК"
     )
 
     output.append("")
 
-    for index, item in enumerate(top_news, start=1):
+    for index, item in enumerate(
+        top_news,
+        start=1
+    ):
 
         publication_age = (
             current_time - item["publication"]
         ).total_seconds() / 3600
 
         if publication_age < 1:
+
             age_text = (
                 f"{max(1, int(publication_age * 60))} мин назад"
             )
+
         else:
+
             age_text = (
                 f"{publication_age:.1f} ч назад"
             )
 
         output.append(
-            f"🔥 TOP-{index}"
+            f"🔥 <b>TOP-{index}</b>"
         )
 
         output.append(
-            f"**{item['title']}**"
+            f"<b>{item['title']}</b>"
         )
 
         output.append(
-            f"Источник: {item['source']}"
+            f"📰 {item['source']}"
         )
 
         output.append(
-            f"Публикация: {format_msk(item['publication'])} МСК"
+            f"🕐 {format_msk(item['publication'])} МСК · {age_text}"
         )
 
-        if item["event"]:
+        output.append(
+            f"📊 Рейтинг: {item['score']}/10"
+        )
+
+        output.append(
+            "✅ <b>Подтверждено вторым источником</b>"
+        )
+
+        if item["secondary_source"]:
+
             output.append(
-                f"Событие: {format_msk(item['event'])} МСК"
+                f"↳ {item['secondary_source']}"
             )
-
-        output.append(
-            f"Свежесть: {item['freshness']}/10"
-        )
-
-        output.append(
-            f"Важность: {item['importance']}/10"
-        )
-
-        output.append(
-            f"Интерес: {item['interest']}/10"
-        )
-
-        output.append(
-            f"Надёжность: {item['reliability']}/10"
-        )
-
-        output.append(
-            f"Редакционный балл: {item['score']}/10"
-        )
-
-        output.append(
-            f"⏱ {age_text}"
-        )
 
         output.append(
             f"🔗 {item['url']}"
@@ -931,15 +1398,19 @@ def news_command(message):
         output.append("")
 
     output.append(
-        "✅ Старые публикации и некорректные даты отфильтрованы программно."
+        "🔒 <i>Старые, англоязычные и "
+        "непрошедшие проверку материалы отфильтрованы.</i>"
     )
 
-    final_text = "\n".join(output)
+    final_text = "\n".join(
+        output
+    )
 
     bot.edit_message_text(
         final_text,
         message.chat.id,
         status.message_id,
+        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
@@ -948,7 +1419,9 @@ def news_command(message):
 # ЗАПУСК
 # ============================================================
 
-print("🧂 МАРИНАД | Telegram bot started")
+print(
+    "🧂 МАРИНАД | Telegram bot started"
+)
 
 bot.infinity_polling(
     skip_pending=True
