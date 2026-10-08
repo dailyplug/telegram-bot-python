@@ -1,44 +1,71 @@
 import os
-import time
 import telebot
-from dotenv import load_dotenv
-from commands import register_commands
 
-# Load environment variables
-load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL = "@marinadnews"
 
-# Replace 'TELEGRAM_BOT_TOKEN' with the token you received from BotFather
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-try:
-    bot = telebot.TeleBot(TOKEN)
-    register_commands(bot)
+bot = telebot.TeleBot(TOKEN)
 
-    @bot.message_handler(commands=['start', 'hello'])
-    def send_welcome(message):
-        """
-        Handle '/start' and '/hello' commands.
 
-        Args:
-            message (telebot.types.Message): The message object.
-        """
-        bot.reply_to(message, "Hello! I'm a simple Telegram bot.")
+@bot.message_handler(commands=["start"])
+def start(message):
+    bot.reply_to(
+        message,
+        "🧂 МАРИНАД на связи.\n\n"
+        "Бот работает.\n"
+        "Используй /myid, чтобы узнать свой Telegram ID.\n"
+        "Используй /publish ТЕКСТ — чтобы опубликовать пост в канале."
+    )
 
-    @bot.message_handler(func=lambda msg: True)
-    def echo_all(message):
-        """
-        Echo all incoming text messages back to the user.
 
-        Args:
-            message (telebot.types.Message): The message object.
-        """
-        bot.reply_to(message, message.text)
+@bot.message_handler(commands=["myid"])
+def myid(message):
+    bot.reply_to(
+        message,
+        f"Твой Telegram ID: `{message.from_user.id}`",
+        parse_mode="Markdown"
+    )
 
-    # Remove webhook to avoid conflicts with polling
-    bot.delete_webhook(drop_pending_updates=True)
-    bot.polling()
 
-except Exception as e:
-    print(f"CRITICAL ERROR: Failed to initialize bot with provided token. Error: {e}")
-    print("The application will hang to prevent a restart loop. Please fix the TELEGRAM_BOT_TOKEN environment variable.")
-    while True:
-        time.sleep(3600)
+@bot.message_handler(commands=["publish"])
+def publish(message):
+    # Проверяем, что команду отправил администратор канала
+    try:
+        member = bot.get_chat_member(CHANNEL, message.from_user.id)
+
+        if member.status not in ["administrator", "creator"]:
+            bot.reply_to(message, "⛔ У тебя нет прав для публикации.")
+            return
+
+    except Exception:
+        bot.reply_to(
+            message,
+            "❌ Не удалось проверить права администратора канала."
+        )
+        return
+
+    text = message.text.replace("/publish", "", 1).strip()
+
+    if not text:
+        bot.reply_to(
+            message,
+            "Напиши текст после команды.\n\n"
+            "Пример:\n"
+            "/publish 🚨 Важная новость"
+        )
+        return
+
+    try:
+        bot.send_message(CHANNEL, text)
+        bot.reply_to(message, "✅ Пост опубликован в @marinadnews.")
+
+    except Exception as e:
+        bot.reply_to(
+            message,
+            f"❌ Ошибка публикации:\n{e}"
+        )
+
+
+print("МАРИНАД | NEWS запущен")
+
+bot.infinity_polling(skip_pending=True)
