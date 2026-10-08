@@ -3,28 +3,34 @@ import telebot
 from openai import OpenAI
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
 CHANNEL = "@marinadnews"
 ADMIN_ID = 6056292876
 
 bot = telebot.TeleBot(TOKEN)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
+)
 
 
 def is_admin(message):
     return message.from_user.id == ADMIN_ID
 
 
-def send_long_message(message, text):
-    """Telegram не принимает сообщения длиннее 4096 символов."""
+def send_long_message(chat_id, text):
+    """Telegram имеет ограничение на длину сообщения."""
     max_length = 4000
 
+    if len(text) <= max_length:
+        bot.send_message(chat_id, text)
+        return
+
     for i in range(0, len(text), max_length):
-        bot.reply_to(message, text[i:i + max_length])
+        bot.send_message(chat_id, text[i:i + max_length])
 
-
-# =========================
-# /start
-# =========================
 
 @bot.message_handler(commands=["start"])
 def start(message):
@@ -36,15 +42,11 @@ def start(message):
         message,
         "🧂 МАРИНАД на связи.\n\n"
         "Бот работает.\n\n"
-        "/myid — показать Telegram ID\n"
-        "/publish ТЕКСТ — опубликовать пост в канале\n"
-        "/ai ТЕКСТ — попросить ИИ обработать материал"
+        "/myid — узнать Telegram ID\n"
+        "/publish ТЕКСТ — опубликовать пост\n"
+        "/ai ТЕКСТ — попросить AI обработать текст"
     )
 
-
-# =========================
-# /myid
-# =========================
 
 @bot.message_handler(commands=["myid"])
 def myid(message):
@@ -54,22 +56,18 @@ def myid(message):
     )
 
 
-# =========================
-# /publish
-# =========================
-
 @bot.message_handler(commands=["publish"])
 def publish(message):
     if not is_admin(message):
         bot.reply_to(message, "⛔ Доступ запрещён.")
         return
 
-    text = message.text.replace("/publish", "", 1).strip()
+    text = message.text[len("/publish"):].strip()
 
     if not text:
         bot.reply_to(
             message,
-            "⚠️ После /publish нужно написать текст поста."
+            "Использование:\n/publish ТЕКСТ"
         )
         return
 
@@ -88,24 +86,18 @@ def publish(message):
         )
 
 
-# =========================
-# /ai
-# =========================
-
 @bot.message_handler(commands=["ai"])
 def ai(message):
     if not is_admin(message):
         bot.reply_to(message, "⛔ Доступ запрещён.")
         return
 
-    prompt = message.text.replace("/ai", "", 1).strip()
+    prompt = message.text[len("/ai"):].strip()
 
     if not prompt:
         bot.reply_to(
             message,
-            "⚠️ После /ai нужно написать задачу.\n\n"
-            "Например:\n"
-            "/ai Напиши короткий пост о росте цен на нефть."
+            "Использование:\n/ai ТЕКСТ"
         )
         return
 
@@ -113,35 +105,34 @@ def ai(message):
 
     try:
         response = client.responses.create(
-            model="gpt-6-astra",
+            model="openai/gpt-oss-120b",
             instructions="""
-Ты — ИИ-редактор Telegram-канала «МАРИНАД».
+Ты — AI-редактор Telegram-канала «МАРИНАД».
 
-Слоган канала: «Вся соль здесь».
-
-Твоя задача — помогать создавать современные русскоязычные
-новостные посты для Telegram.
+Твоя задача — помогать готовить материалы для новостного Telegram-канала.
 
 Стиль:
-— живой;
-— быстрый;
-— современный;
-— информативный;
-— без канцелярита;
-— без лишних вступлений;
-— допускается умеренный кликбейт, но нельзя искажать факты;
-— не выдумывай факты, цифры, цитаты или источники;
-— не добавляй дату в начало поста;
-— не используй старый слоган «Новости без лишнего шума»;
-— не добавляй подпись @marinadnews, если пользователь отдельно не попросил;
-— обычно стремись к 300–700 символам, если задача не требует другого объёма.
+- современный;
+- живой;
+- краткий;
+- понятный;
+- без канцелярита;
+- допускается умеренный кликбейт, но нельзя искажать факты;
+- русский язык;
+- без лишних вступлений;
+- без даты в начале поста;
+- без фразы «Новости без лишнего шума»;
+- не придумывай факты, цифры, цитаты или источники;
+- если информации недостаточно, прямо укажи это;
+- обычно 300–700 символов, если пользователь не попросил другой объём.
 
-Если пользователь прислал новость или материал — сначала пойми суть,
-затем предложи готовый вариант публикации.
+Если пользователь прислал исходный материал, сначала пойми его смысл,
+а затем переработай его в качественный материал для «МАРИНАДА».
 
-Если данных недостаточно для утверждения факта, прямо укажи на это.
+Если пользователь просит просто ответить на вопрос — отвечай непосредственно,
+а не обязательно оформляй ответ как новость.
 """,
-            input=prompt
+            input=prompt,
         )
 
         result = response.output_text.strip()
@@ -149,23 +140,18 @@ def ai(message):
         if not result:
             bot.reply_to(
                 message,
-                "⚠️ ИИ не вернул текст."
+                "❌ AI вернул пустой ответ."
             )
             return
 
-        send_long_message(message, result)
+        send_long_message(message.chat.id, result)
 
     except Exception as e:
         bot.reply_to(
             message,
-            f"❌ Ошибка OpenAI:\n{e}"
+            f"❌ Ошибка Groq:\n{e}"
         )
 
 
-# =========================
-# Запуск бота
-# =========================
-
-print("🧂 МАРИНАД | Бот запущен")
-
+print("🧂 МАРИНАД | Бот запущен.")
 bot.infinity_polling()
