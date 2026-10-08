@@ -12,6 +12,7 @@ classifiers = [
 dependencies = [
     "pytelegrambotapi>=4.30.0,<5",
     "python-dotenv>=1.2.1,<2",
+        "openai>=1.0.0,<2",
 ]
 
 [tool.uv]
