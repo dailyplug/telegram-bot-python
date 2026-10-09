@@ -41,12 +41,9 @@ FINAL_NEWS_WINDOW_HOURS = 24
 # Допустимая погрешность времени
 FUTURE_TOLERANCE_MINUTES = 15
 
-# Минимальное количество кандидатов
-MIN_CANDIDATES = 3
-
-# Сколько новостей дополнительно проверяем.
-# Меньше проверок = меньше отдельных browser_search-вызовов.
-MAX_VERIFICATION_CANDIDATES = 3
+# Проверяем максимум две новости за один запуск, чтобы ограничить расход токенов.
+# Если первый поиск уже дал кандидатов, не запускаем второй поиск только ради количества.
+MAX_VERIFICATION_CANDIDATES = 2
 
 # Ограничиваем одновременные поиски, чтобы команды не сжигали лимит параллельно.
 NEWS_LOCK = threading.Lock()
@@ -88,10 +85,19 @@ def friendly_api_error(error):
     lowered = message.lower()
 
     if status == 429 or "rate_limit" in lowered or "rate limit" in lowered:
+        retry_after = None
+        response_obj = getattr(error, "response", None)
+        headers = getattr(response_obj, "headers", None)
+        if headers:
+            try:
+                retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            except Exception:
+                retry_after = None
+        wait_text = f" Попробуй снова примерно через {retry_after} сек." if retry_after and str(retry_after).isdigit() else ""
         return (
-            "Groq временно ограничил запросы или исчерпан лимит модели. "
-            "Подожди восстановления лимита и повтори команду. "
-            "Проверь Usage/Limits в консоли Groq."
+            "Groq вернул ограничение 429: превышен лимит запросов или токенов "
+            "для выбранной модели. Это не ошибка фактчекинга и не доказательство, "
+            "что новости ложные. Проверь Usage/Limits в консоли Groq." + wait_text
         )
 
     if status in (401, 403) or "authentication" in lowered or "invalid api key" in lowered:
@@ -1309,33 +1315,46 @@ def news_command(message):
     )
 
     # ========================================================
-    # ВТОРОЙ ПОИСК
+    # УДАЛЯЕМ ДУБЛИКАТЫ ПЕРЕД РЕШЕНИЕМ О ПОВТОРНОМ ПОИСКЕ
     # ========================================================
 
-    if len(candidates) < MIN_CANDIDATES:
+    candidates = remove_duplicates(candidates)
 
-        raw_second = search_news_second_pass(
-            topic
-        )
+    # ========================================================
+    # ВТОРОЙ ПОИСК — ТОЛЬКО ЕСЛИ ПЕРВЫЙ НЕ ДАЛ НИ ОДНОГО КАНДИДАТА
+    # ========================================================
+
+    if not candidates:
+        raw_second = search_news_second_pass(topic)
 
         if not raw_second.startswith("ERROR|"):
-
-            second_candidates = parse_news_candidates(
-                raw_second,
-                current_time
+            second_candidates = parse_news_candidates(raw_second, current_time)
+            candidates = remove_duplicates(second_candidates)
+        else:
+            second_pass_error = raw_second[6:]
+            user_error = friendly_api_error(Exception(second_pass_error))
+            if is_rate_limit_error(Exception(second_pass_error)):
+                message_text = (
+                    "⏳ <b>Groq ограничил запросы во время поиска.</b>\n\n"
+                    "Первый поиск не дал подходящих кандидатов, а дополнительный запрос "
+                    "не выполнился из-за лимита. Это не означает, что новости ложные.\n\n"
+                    + html.escape(user_error)
+                )
+            else:
+                message_text = (
+                    "❌ <b>Не удалось завершить поиск новостей.</b>\n\n"
+                    + html.escape(user_error)
+                )
+            bot.edit_message_text(
+                message_text,
+                message.chat.id,
+                status.message_id,
+                parse_mode="HTML",
             )
+            return
 
-            candidates.extend(
-                second_candidates
-            )
-
-    # ========================================================
-    # УДАЛЯЕМ ДУБЛИКАТЫ
-    # ========================================================
-
-    candidates = remove_duplicates(
-        candidates
-    )
+    # Повторная дедупликация — защита на случай изменений в логике объединения.
+    candidates = remove_duplicates(candidates)
 
     # ========================================================
     # СОРТИРУЕМ
@@ -1535,7 +1554,8 @@ def news_command(message):
 # ============================================================
 
 print(
-    "🧂 МАРИНАД | Telegram bot started"
+    f"🧂 МАРИНАД | Telegram bot started | model={GROQ_MODEL} | "
+    f"verification_candidates={MAX_VERIFICATION_CANDIDATES}"
 )
 
 bot.infinity_polling(
