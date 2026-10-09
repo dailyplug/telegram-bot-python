@@ -1,9 +1,14 @@
 import os
 import re
+import html
+import time
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
+from functools import wraps
+from difflib import SequenceMatcher
 
 import telebot
 from openai import OpenAI
@@ -19,6 +24,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 CHANNEL = "@marinadnews"
 ADMIN_ID = 6056292876
 
+# Основная модель выбрана экономичнее, чем gpt-oss-120b.
+# Её можно заменить в Railway → Variables без правки кода.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+GROQ_TIMEOUT_SECONDS = 75
+GROQ_MAX_RETRIES = 0  # не тратим токены на скрытые повторы SDK
+
 MSK = timezone(timedelta(hours=3))
 
 # Ищем шире
@@ -33,13 +44,27 @@ FUTURE_TOLERANCE_MINUTES = 15
 # Минимальное количество кандидатов
 MIN_CANDIDATES = 3
 
-# Сколько новостей дополнительно проверяем
-MAX_VERIFICATION_CANDIDATES = 5
+# Сколько новостей дополнительно проверяем.
+# Меньше проверок = меньше отдельных browser_search-вызовов.
+MAX_VERIFICATION_CANDIDATES = 3
+
+# Ограничиваем одновременные поиски, чтобы команды не сжигали лимит параллельно.
+NEWS_LOCK = threading.Lock()
+
+# Кэш проверок ссылок в рамках работы процесса.
+URL_CHECK_CACHE = {}
+URL_CHECK_CACHE_TTL = 300
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
+
+if not TOKEN:
+    raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN в Railway.")
+
+if not GROQ_API_KEY:
+    raise RuntimeError("Не задана переменная окружения GROQ_API_KEY в Railway.")
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -51,7 +76,62 @@ bot = telebot.TeleBot(TOKEN)
 client = OpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1",
+    timeout=GROQ_TIMEOUT_SECONDS,
+    max_retries=GROQ_MAX_RETRIES,
 )
+
+
+def friendly_api_error(error):
+    """Преобразует ошибки API в короткие понятные сообщения без лишнего дампа."""
+    message = str(error)
+    status = getattr(error, "status_code", None)
+    lowered = message.lower()
+
+    if status == 429 or "rate_limit" in lowered or "rate limit" in lowered:
+        return (
+            "Groq временно ограничил запросы или исчерпан лимит модели. "
+            "Подожди восстановления лимита и повтори команду. "
+            "Проверь Usage/Limits в консоли Groq."
+        )
+
+    if status in (401, 403) or "authentication" in lowered or "invalid api key" in lowered:
+        return "Groq отклонил авторизацию. Проверь переменную GROQ_API_KEY в Railway."
+
+    if "model" in lowered and ("not found" in lowered or "unsupported" in lowered):
+        return (
+            f"Модель {GROQ_MODEL} недоступна для этого запроса. "
+            "Проверь имя модели в Railway → Variables."
+        )
+
+    return f"Ошибка внешнего API ({status or 'без кода'}): {message[:500]}"
+
+
+def is_rate_limit_error(error):
+    message = str(error).lower()
+    return (
+        getattr(error, "status_code", None) == 429
+        or "rate_limit" in message
+        or "rate limit" in message
+        or "tokens per day" in message
+        or "tokens per minute" in message
+    )
+
+
+def prevent_concurrent_news(function):
+    """Не даёт нескольким /news запускать тяжёлые поиски одновременно."""
+    @wraps(function)
+    def wrapped(message):
+        if not NEWS_LOCK.acquire(blocking=False):
+            bot.reply_to(
+                message,
+                "⏳ Поиск новостей уже выполняется. Дождись ответа и затем повтори команду."
+            )
+            return
+        try:
+            return function(message)
+        finally:
+            NEWS_LOCK.release()
+    return wrapped
 
 
 # ============================================================
@@ -102,12 +182,20 @@ def send_long_message(chat_id, text):
     max_length = 4000
 
     if len(text) <= max_length:
-        bot.send_message(
-            chat_id,
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        try:
+            bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            plain_text = html.unescape(re.sub(r"<[^>]*>", "", text))
+            bot.send_message(
+                chat_id,
+                plain_text,
+                disable_web_page_preview=True
+            )
         return
 
     parts = []
@@ -126,12 +214,20 @@ def send_long_message(chat_id, text):
         parts.append(text)
 
     for part in parts:
-        bot.send_message(
-            chat_id,
-            part,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
+        try:
+            bot.send_message(
+                chat_id,
+                part,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception:
+            plain_text = html.unescape(re.sub(r"<[^>]*>", "", part))
+            bot.send_message(
+                chat_id,
+                plain_text,
+                disable_web_page_preview=True
+            )
 
 
 def parse_iso_datetime(value):
@@ -248,14 +344,10 @@ def is_russian_title(title):
 def get_domain(url):
     try:
         parsed = urlparse(url)
-
-        domain = parsed.netloc.lower()
-
+        domain = (parsed.hostname or "").lower()
         if domain.startswith("www."):
             domain = domain[4:]
-
         return domain
-
     except Exception:
         return ""
 
@@ -278,74 +370,53 @@ def is_trusted_domain(url):
 
 
 def check_url(url):
-    """
-    Проверяем:
-    1. корректность URL;
-    2. HTTPS;
-    3. домен;
-    4. доступность страницы.
-
-    Некоторые СМИ могут отвечать 403/405 на автоматические запросы.
-    Это не обязательно означает, что ссылка фальшивая.
-    """
-
-    if not url:
+    """Проверяет HTTPS, разрешённый домен и базовую доступность ссылки."""
+    if not url or not isinstance(url, str):
         return False, "пустой URL"
 
-    if not url.startswith("https://"):
-        return False, "не HTTPS"
-
-    parsed = urlparse(url)
-
-    if not parsed.netloc:
-        return False, "некорректный URL"
-
-    domain = get_domain(url)
-
-    if not is_trusted_domain(url):
-        return False, f"неразрешённый источник: {domain}"
+    url = url.strip()
+    cached = URL_CHECK_CACHE.get(url)
+    if cached and time.time() - cached[0] < URL_CHECK_CACHE_TTL:
+        return cached[1], cached[2]
 
     try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            result = (False, "нужна корректная HTTPS-ссылка")
+        elif parsed.username or parsed.password:
+            result = (False, "URL с данными авторизации запрещён")
+        elif not is_trusted_domain(url):
+            result = (False, f"неразрешённый источник: {get_domain(url)}")
+        else:
+            request = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; MARINAD-NewsBot/2.0)"
+                },
+                method="HEAD",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=4) as response:
+                    status = response.status
+                if 200 <= status < 400 or status in (401, 403, 405, 429):
+                    result = (True, f"сервер ответил HTTP {status}")
+                else:
+                    result = (False, f"HTTP {status}")
+            except urllib.error.HTTPError as error:
+                if error.code in (401, 403, 405, 429):
+                    result = (True, f"сервер ответил HTTP {error.code}")
+                else:
+                    result = (False, f"HTTP {error.code}")
+            except Exception:
+                # Часть СМИ блокирует HEAD или автоматические запросы.
+                # Для доверенного домена с таймаутом не утверждаем, что ссылка фальшивая.
+                result = (True, "домен доверенный, доступность страницы не подтверждена")
 
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(compatible; MARINAD-NewsBot/1.0)"
-                )
-            },
-            method="HEAD"
-        )
+    except Exception:
+        result = (False, "некорректный URL")
 
-        with urllib.request.urlopen(
-            request,
-            timeout=8
-        ) as response:
-
-            status = response.status
-
-            if 200 <= status < 400:
-                return True, "OK"
-
-            if status in (401, 403, 405, 429):
-                return True, f"сервер доступен, HTTP {status}"
-
-            return False, f"HTTP {status}"
-
-    except urllib.error.HTTPError as e:
-
-        if e.code in (401, 403, 405, 429):
-            return True, f"сервер доступен, HTTP {e.code}"
-
-        return False, f"HTTP {e.code}"
-
-    except Exception as e:
-
-        # Сетевой таймаут не доказывает,
-        # что URL фальшивый.
-        # Но для неизвестного источника мы его отбрасываем.
-        return False, "страница недоступна"
+    URL_CHECK_CACHE[url] = (time.time(), result[0], result[1])
+    return result
 
 
 # ============================================================
@@ -382,14 +453,15 @@ def parse_news_candidates(
         source = parts[4].strip()
         url = parts[5].strip()
 
-        try:
+        if not title or not source or len(title) > 280:
+            continue
 
+        try:
             freshness = int(parts[6].strip())
             importance = int(parts[7].strip())
             interest = int(parts[8].strip())
             reliability = int(parts[9].strip())
-
-        except Exception:
+        except (ValueError, TypeError):
             continue
 
         publication_dt = parse_iso_datetime(
@@ -526,39 +598,33 @@ def parse_news_candidates(
 # ============================================================
 
 def normalize_title(title):
-
-    normalized = title.lower()
-
-    normalized = re.sub(
-        r"[^а-яa-z0-9 ]",
-        " ",
-        normalized
-    )
-
-    normalized = re.sub(
-        r"\s+",
-        " ",
-        normalized
-    )
-
+    normalized = (title or "").lower().replace("ё", "е")
+    normalized = re.sub(r"[^а-яa-z0-9 ]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
     return normalized.strip()
 
 
 def remove_duplicates(candidates):
-
     result = []
-    seen = set()
+    seen_urls = set()
+    seen_titles = []
 
     for item in candidates:
+        url_key = (item.get("url") or "").rstrip("/").lower()
+        title_key = normalize_title(item.get("title", ""))
 
-        key = normalize_title(
-            item["title"]
-        )
-
-        if key in seen:
+        if not title_key or url_key in seen_urls:
             continue
 
-        seen.add(key)
+        # Убираем почти одинаковые заголовки из разных перепечаток.
+        if any(
+            SequenceMatcher(None, title_key, existing).ratio() >= 0.90
+            for existing in seen_titles
+        ):
+            continue
+
+        seen_urls.add(url_key)
+        seen_titles.append(title_key)
         result.append(item)
 
     return result
@@ -629,8 +695,9 @@ VERIFY|NO|NONE|NONE|reason
     try:
 
         response = client.responses.create(
-            model="openai/gpt-oss-120b",
+            model=GROQ_MODEL,
             input=prompt,
+            max_output_tokens=1400,
             tools=[
                 {
                     "type": "browser_search"
@@ -667,12 +734,52 @@ VERIFY|NO|NONE|NONE|reason
             ).strip()
 
             if decision == "YES":
+                primary_domain = get_domain(candidate.get("url", ""))
+                secondary_domain = get_domain(secondary_url)
+
+                if not secondary_source or not secondary_url or secondary_url.upper() == "NONE":
+                    return {
+                        "verified": False,
+                        "secondary_source": "",
+                        "secondary_url": "",
+                        "reason": "нет ссылки на независимое подтверждение",
+                        "error": False,
+                    }
+
+                if not is_trusted_domain(secondary_url):
+                    return {
+                        "verified": False,
+                        "secondary_source": "",
+                        "secondary_url": "",
+                        "reason": "второй источник не входит в список доверенных",
+                        "error": False,
+                    }
+
+                if secondary_domain == primary_domain:
+                    return {
+                        "verified": False,
+                        "secondary_source": "",
+                        "secondary_url": "",
+                        "reason": "второй источник совпадает с первым",
+                        "error": False,
+                    }
+
+                secondary_ok, secondary_reason = check_url(secondary_url)
+                if not secondary_ok:
+                    return {
+                        "verified": False,
+                        "secondary_source": "",
+                        "secondary_url": "",
+                        "reason": f"вторичная ссылка не прошла проверку: {secondary_reason}",
+                        "error": False,
+                    }
 
                 return {
                     "verified": True,
                     "secondary_source": secondary_source,
                     "secondary_url": secondary_url,
                     "reason": reason,
+                    "error": False,
                 }
 
             return {
@@ -680,6 +787,7 @@ VERIFY|NO|NONE|NONE|reason
                 "secondary_source": "",
                 "secondary_url": "",
                 "reason": reason,
+                "error": False,
             }
 
     except Exception as e:
@@ -688,14 +796,18 @@ VERIFY|NO|NONE|NONE|reason
             "verified": False,
             "secondary_source": "",
             "secondary_url": "",
-            "reason": str(e),
+            "reason": friendly_api_error(e),
+            "error": True,
+            "rate_limited": is_rate_limit_error(e),
         }
 
     return {
         "verified": False,
         "secondary_source": "",
         "secondary_url": "",
-        "reason": "не удалось получить проверку",
+        "reason": "ответ модели не содержит корректного VERIFY-решения",
+        "error": True,
+        "rate_limited": False,
     }
 
 
@@ -772,8 +884,9 @@ NEWS|РУССКИЙ ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|fres
     try:
 
         response = client.responses.create(
-            model="openai/gpt-oss-120b",
+            model=GROQ_MODEL,
             input=prompt,
+            max_output_tokens=1000,
             tools=[
                 {
                     "type": "browser_search"
@@ -905,7 +1018,9 @@ URL должен быть РЕАЛЬНОЙ ссылкой на конкретн�
 Если старое событие получило новое развитие,
 используй именно новую публикацию.
 
-Найди минимум 8 кандидатов, если это возможно.
+Найди до 8 кандидатов, если это возможно. Не заполняй список выдуманными новостями.
+
+Пиши максимально компактно, без повторов и лишних пояснений.
 
 Оцени:
 
@@ -931,8 +1046,9 @@ NEWS|РУССКИЙ ЗАГОЛОВОК|publication_iso|event_iso|SOURCE|URL|fres
     try:
 
         response = client.responses.create(
-            model="openai/gpt-oss-120b",
+            model=GROQ_MODEL,
             input=prompt,
+            max_output_tokens=700,
             tools=[
                 {
                     "type": "browser_search"
@@ -1051,10 +1167,11 @@ def publish_command(message):
         )
 
     except Exception as e:
-
         bot.reply_to(
             message,
-            f"❌ Ошибка публикации:\n{e}"
+            "❌ Не удалось опубликовать пост. "
+            "Проверь права бота в канале, длину текста и HTML-разметку.\n"
+            + str(e)[:400]
         )
 
 
@@ -1098,7 +1215,8 @@ def ai_command(message):
 
         response = client.responses.create(
 
-            model="openai/gpt-oss-120b",
+            model=GROQ_MODEL,
+            max_output_tokens=1500,
 
             instructions="""
 Ты — главный редактор Telegram-канала МАРИНАД.
@@ -1123,10 +1241,9 @@ def ai_command(message):
 300–700 символов.
 
 Не добавляй:
-
-«СВЕДЕО»
-«Новости без лишнего шума»
-дату отдельной строкой.
+- «СВЕДЕО»;
+- «Новости без лишнего шума»;
+- дату отдельной строкой.
 
 Слоган МАРИНАД:
 
@@ -1151,9 +1268,8 @@ def ai_command(message):
         )
 
     except Exception as e:
-
         bot.edit_message_text(
-            f"❌ Ошибка ИИ:\n{e}",
+            "❌ " + friendly_api_error(e),
             message.chat.id,
             status.message_id
         )
@@ -1164,6 +1280,7 @@ def ai_command(message):
 # ============================================================
 
 @bot.message_handler(commands=["news"])
+@prevent_concurrent_news
 def news_command(message):
 
     if not is_admin(message):
@@ -1201,13 +1318,14 @@ def news_command(message):
     raw_first = search_news(topic)
 
     if raw_first.startswith("ERROR|"):
-
+        error_text = raw_first[6:]
         bot.edit_message_text(
-            "❌ Ошибка поиска:\n" + raw_first[6:],
+            "❌ <b>Не удалось выполнить поиск.</b>\n\n"
+            + html.escape(friendly_api_error(Exception(error_text))),
             message.chat.id,
-            status.message_id
+            status.message_id,
+            parse_mode="HTML",
         )
-
         return
 
     candidates = parse_news_candidates(
@@ -1257,17 +1375,20 @@ def news_command(message):
     # ========================================================
 
     verified_candidates = []
+    verification_errors = 0
+    rate_limited = False
 
-    for candidate in candidates[
-        :MAX_VERIFICATION_CANDIDATES
-    ]:
+    for candidate in candidates[:MAX_VERIFICATION_CANDIDATES]:
 
         verification = verify_candidate(
             candidate
         )
 
-        if verification["verified"]:
+        if verification.get("error"):
+            verification_errors += 1
+            rate_limited = rate_limited or verification.get("rate_limited", False)
 
+        if verification["verified"]:
             candidate["verified"] = True
 
             candidate["verification_score"] = 10
@@ -1295,21 +1416,34 @@ def news_command(message):
     # ========================================================
 
     if len(verified_candidates) == 0:
+        # Отличаем реальное отсутствие подтверждения от сбоя внешнего API.
+        if verification_errors:
+            if rate_limited:
+                message_text = (
+                    "⏳ <b>Groq временно ограничил запросы.</b>\n\n"
+                    "Бот нашёл кандидатов, но не смог завершить фактчекинг. "
+                    "Это не означает, что новости ложные. Подожди восстановления лимита "
+                    "и повтори /news."
+                )
+            else:
+                message_text = (
+                    "⚠️ <b>Не удалось завершить проверку новостей.</b>\n\n"
+                    "Внешний сервис не вернул корректный результат для части кандидатов. "
+                    "Бот не будет помечать их как подтверждённые. Попробуй ещё раз позже."
+                )
+        else:
+            message_text = (
+                "⚠️ <b>Подтверждённых новостей не найдено.</b>\n\n"
+                "Кандидаты не прошли проверку независимым доверенным источником. "
+                "Это не доказывает, что они ложные, — просто подтверждения не удалось получить."
+            )
 
-        # Не показываем потенциально сомнительные новости.
         bot.edit_message_text(
-            (
-                "⚠️ <b>Надёжных новостей не найдено.</b>\n\n"
-                "Поиск дал кандидатов, но они не прошли "
-                "вторичную проверку.\n\n"
-                "Старые и неподтверждённые материалы "
-                "бот не показывает."
-            ),
+            message_text,
             message.chat.id,
             status.message_id,
-            parse_mode="HTML"
+            parse_mode="HTML",
         )
-
         return
 
     # ========================================================
@@ -1365,13 +1499,12 @@ def news_command(message):
             f"🔥 <b>TOP-{index}</b>"
         )
 
-        output.append(
-            f"<b>{item['title']}</b>"
-        )
+        safe_title = html.escape(item["title"])
+        safe_source = html.escape(item["source"])
+        safe_secondary_source = html.escape(item.get("secondary_source", ""))
 
-        output.append(
-            f"📰 {item['source']}"
-        )
+        output.append(f"<b>{safe_title}</b>")
+        output.append(f"📰 {safe_source}")
 
         output.append(
             f"🕐 {format_msk(item['publication'])} МСК · {age_text}"
@@ -1386,14 +1519,13 @@ def news_command(message):
         )
 
         if item["secondary_source"]:
+            output.append(f"↳ {safe_secondary_source}")
 
-            output.append(
-                f"↳ {item['secondary_source']}"
-            )
-
-        output.append(
-            f"🔗 {item['url']}"
-        )
+        safe_url = html.escape(item["url"], quote=True)
+        output.append(f"🔗 {safe_url}")
+        if item.get("secondary_url"):
+            safe_secondary_url = html.escape(item["secondary_url"], quote=True)
+            output.append(f"↳ Подтверждение: {safe_secondary_url}")
 
         output.append("")
 
@@ -1424,5 +1556,7 @@ print(
 )
 
 bot.infinity_polling(
-    skip_pending=True
+    skip_pending=True,
+    timeout=30,
+    long_polling_timeout=25,
 )
