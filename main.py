@@ -651,164 +651,139 @@ def sort_candidates(candidates):
 # ============================================================
 
 def verify_candidate(candidate):
-
+    """Проверяет публикацию и различает двойное подтверждение и один источник."""
     prompt = f"""
-Ты — фактчекер Telegram-канала МАРИНАД.
+Ты — фактчекер Telegram-канала МАРИНАД. Выполни browser search.
 
-Нужно проверить конкретную новость.
+ПРОВЕРЯЕМАЯ НОВОСТЬ:
+Заголовок: {candidate["title"]}
+Источник: {candidate["source"]}
+URL: {candidate["url"]}
+Заявленная дата: {candidate["publication"].isoformat()}
 
-ЗАГОЛОВОК:
-{candidate["title"]}
+Сначала найди ИМЕННО указанную публикацию. Убедись, что страница/результат
+реально существует, содержание соответствует заголовку, а дата не противоречит
+заявленной дате. Не делай вывод только по совпадению домена.
 
-ИСТОЧНИК:
-{candidate["source"]}
+Затем ищи независимое подтверждение у другого доверенного СМИ или официального
+источника. Перепечатки одного агентства не считаются независимыми.
+Не выдумывай названия источников, даты или URL.
 
-URL:
-{candidate["url"]}
-
-Найди эту публикацию через browser search.
-
-ВАЖНО:
-1. Проверь, существует ли реально указанная публикация.
-2. Проверь, соответствует ли содержание публикации заголовку.
-3. Проверь дату публикации.
-4. Найди независимое подтверждение этой же новости,
-   желательно у другого крупного СМИ или официального источника.
-5. Не считай перепечатки одного агентства независимыми источниками.
-
-ОТВЕТ ДОЛЖЕН БЫТЬ СТРОГО В ФОРМАТЕ:
-
+Верни ровно одну строку в одном из форматов:
 VERIFY|YES|secondary_source|secondary_url|reason
-
-или
-
+SINGLE|YES|NONE|NONE|reason
 VERIFY|NO|NONE|NONE|reason
 
+Используй VERIFY|YES только если нашёл реальную исходную публикацию И реальную
+независимую публикацию на другом домене, подтверждающую то же событие.
+Используй SINGLE|YES только если исходная публикация действительно найдена,
+заголовок и дата соответствуют, но независимое подтверждение найти не удалось.
+Если исходная публикация не найдена, дата/содержание не совпадают или результат
+неоднозначен — VERIFY|NO. Не выдавай отсутствие подтверждения за доказательство лжи.
 Никаких дополнительных строк.
-
-Не придумывай URL.
-Если независимого подтверждения нет,
-это не обязательно означает, что новость ложная,
-но укажи VERIFY|NO.
 """
 
     try:
-
         response = client.responses.create(
             model=GROQ_MODEL,
             input=prompt,
-            max_output_tokens=1400,
-            tools=[
-                {
-                    "type": "browser_search"
-                }
-            ],
+            max_output_tokens=900,
+            tools=[{"type": "browser_search"}],
             tool_choice="required",
-            reasoning={
-                "effort": "low"
-            },
+            reasoning={"effort": "low"},
         )
-
-        result = response.output_text.strip()
+        result = (response.output_text or "").strip()
 
         for line in result.splitlines():
-
             line = line.strip()
-
-            if not line.startswith("VERIFY|"):
+            if not (line.startswith("VERIFY|") or line.startswith("SINGLE|")):
                 continue
-
-            parts = line.split("|")
-
+            parts = line.split("|", 4)
             if len(parts) < 5:
                 continue
 
+            kind = parts[0].strip().upper()
             decision = parts[1].strip().upper()
+            source = parts[2].strip()
+            url = parts[3].strip()
+            reason = parts[4].strip()
 
-            secondary_source = parts[2].strip()
+            if kind == "SINGLE" and decision == "YES":
+                # Кандидат остаётся только в явно помеченной категории одного источника.
+                primary_ok, primary_reason = check_url(candidate.get("url", ""))
+                if not primary_ok or not is_trusted_domain(candidate.get("url", "")):
+                    return {
+                        "verified": False, "single_source": False,
+                        "secondary_source": "", "secondary_url": "",
+                        "reason": f"исходная ссылка не прошла проверку: {primary_reason}",
+                        "error": False, "rate_limited": False,
+                    }
+                return {
+                    "verified": False, "single_source": True,
+                    "secondary_source": "", "secondary_url": "",
+                    "reason": reason or "исходная публикация найдена; независимое подтверждение не найдено",
+                    "error": False, "rate_limited": False,
+                }
 
-            secondary_url = parts[3].strip()
-
-            reason = "|".join(
-                parts[4:]
-            ).strip()
-
-            if decision == "YES":
+            if kind == "VERIFY" and decision == "YES":
                 primary_domain = get_domain(candidate.get("url", ""))
-                secondary_domain = get_domain(secondary_url)
-
-                if not secondary_source or not secondary_url or secondary_url.upper() == "NONE":
+                secondary_domain = get_domain(url)
+                if not source or not url or url.upper() == "NONE":
                     return {
-                        "verified": False,
-                        "secondary_source": "",
-                        "secondary_url": "",
+                        "verified": False, "single_source": False,
+                        "secondary_source": "", "secondary_url": "",
                         "reason": "нет ссылки на независимое подтверждение",
-                        "error": False,
+                        "error": False, "rate_limited": False,
                     }
-
-                if not is_trusted_domain(secondary_url):
+                if not is_trusted_domain(url):
                     return {
-                        "verified": False,
-                        "secondary_source": "",
-                        "secondary_url": "",
+                        "verified": False, "single_source": False,
+                        "secondary_source": "", "secondary_url": "",
                         "reason": "второй источник не входит в список доверенных",
-                        "error": False,
+                        "error": False, "rate_limited": False,
                     }
-
                 if secondary_domain == primary_domain:
                     return {
-                        "verified": False,
-                        "secondary_source": "",
-                        "secondary_url": "",
+                        "verified": False, "single_source": False,
+                        "secondary_source": "", "secondary_url": "",
                         "reason": "второй источник совпадает с первым",
-                        "error": False,
+                        "error": False, "rate_limited": False,
                     }
-
-                secondary_ok, secondary_reason = check_url(secondary_url)
+                secondary_ok, secondary_reason = check_url(url)
                 if not secondary_ok:
                     return {
-                        "verified": False,
-                        "secondary_source": "",
-                        "secondary_url": "",
+                        "verified": False, "single_source": False,
+                        "secondary_source": "", "secondary_url": "",
                         "reason": f"вторичная ссылка не прошла проверку: {secondary_reason}",
-                        "error": False,
+                        "error": False, "rate_limited": False,
                     }
-
                 return {
-                    "verified": True,
-                    "secondary_source": secondary_source,
-                    "secondary_url": secondary_url,
-                    "reason": reason,
-                    "error": False,
+                    "verified": True, "single_source": False,
+                    "secondary_source": source, "secondary_url": url,
+                    "reason": reason, "error": False, "rate_limited": False,
                 }
 
             return {
-                "verified": False,
-                "secondary_source": "",
-                "secondary_url": "",
-                "reason": reason,
-                "error": False,
+                "verified": False, "single_source": False,
+                "secondary_source": "", "secondary_url": "",
+                "reason": reason or "проверка не пройдена",
+                "error": False, "rate_limited": False,
             }
 
-    except Exception as e:
-
         return {
-            "verified": False,
-            "secondary_source": "",
-            "secondary_url": "",
-            "reason": friendly_api_error(e),
-            "error": True,
-            "rate_limited": is_rate_limit_error(e),
+            "verified": False, "single_source": False,
+            "secondary_source": "", "secondary_url": "",
+            "reason": "ответ фактчекера не распознан", "error": False,
+            "rate_limited": False,
         }
 
-    return {
-        "verified": False,
-        "secondary_source": "",
-        "secondary_url": "",
-        "reason": "ответ модели не содержит корректного VERIFY-решения",
-        "error": True,
-        "rate_limited": False,
-    }
+    except Exception as e:
+        return {
+            "verified": False, "single_source": False,
+            "secondary_source": "", "secondary_url": "",
+            "reason": friendly_api_error(e), "error": True,
+            "rate_limited": is_rate_limit_error(e),
+        }
 
 
 # ============================================================
@@ -1375,48 +1350,45 @@ def news_command(message):
     # ========================================================
 
     verified_candidates = []
+    single_source_candidates = []
     verification_errors = 0
     rate_limited = False
+    rejection_reasons = []
 
     for candidate in candidates[:MAX_VERIFICATION_CANDIDATES]:
-
-        verification = verify_candidate(
-            candidate
-        )
+        verification = verify_candidate(candidate)
 
         if verification.get("error"):
             verification_errors += 1
             rate_limited = rate_limited or verification.get("rate_limited", False)
 
-        if verification["verified"]:
+        reason = verification.get("reason", "")
+        if reason and not verification.get("verified") and not verification.get("single_source"):
+            rejection_reasons.append(reason[:120])
+
+        if verification.get("verified"):
             candidate["verified"] = True
-
+            candidate["single_source"] = False
             candidate["verification_score"] = 10
+            candidate["secondary_source"] = verification["secondary_source"]
+            candidate["secondary_url"] = verification["secondary_url"]
+            candidate["score"] = round(candidate["score"] + 0.45, 2)
+            verified_candidates.append(candidate)
 
-            candidate["secondary_source"] = (
-                verification["secondary_source"]
-            )
+        elif verification.get("single_source"):
+            candidate["verified"] = False
+            candidate["single_source"] = True
+            candidate["secondary_source"] = ""
+            candidate["secondary_url"] = ""
+            candidate["verification_reason"] = reason
+            # Не повышаем рейтинг: одиночный источник уступает двойному подтверждению.
+            single_source_candidates.append(candidate)
 
-            candidate["secondary_url"] = (
-                verification["secondary_url"]
-            )
+    # Двойное подтверждение всегда имеет приоритет. К одиночным источникам
+    # переходим только если ни одна новость не получила независимого подтверждения.
+    using_single_source = not verified_candidates and bool(single_source_candidates)
 
-            # Бонус за независимое подтверждение
-            candidate["score"] = round(
-                candidate["score"] + 0.45,
-                2
-            )
-
-            verified_candidates.append(
-                candidate
-            )
-
-    # ========================================================
-    # ЕСЛИ ВТОРИЧНАЯ ПРОВЕРКА НЕ НАШЛА НИЧЕГО
-    # ========================================================
-
-    if len(verified_candidates) == 0:
-        # Отличаем реальное отсутствие подтверждения от сбоя внешнего API.
+    if not verified_candidates and not single_source_candidates:
         if verification_errors:
             if rate_limited:
                 message_text = (
@@ -1428,14 +1400,21 @@ def news_command(message):
             else:
                 message_text = (
                     "⚠️ <b>Не удалось завершить проверку новостей.</b>\n\n"
-                    "Внешний сервис не вернул корректный результат для части кандидатов. "
-                    "Бот не будет помечать их как подтверждённые. Попробуй ещё раз позже."
+                    "Внешний сервис не вернул корректный результат. "
+                    "Бот не будет помечать кандидатов как подтверждённые. Попробуй позже."
                 )
         else:
+            details = ""
+            if rejection_reasons:
+                unique_reasons = list(dict.fromkeys(rejection_reasons))[:3]
+                details = "\n\nПричины отказа: " + "; ".join(
+                    html.escape(reason) for reason in unique_reasons
+                )
             message_text = (
-                "⚠️ <b>Подтверждённых новостей не найдено.</b>\n\n"
-                "Кандидаты не прошли проверку независимым доверенным источником. "
-                "Это не доказывает, что они ложные, — просто подтверждения не удалось получить."
+                "⚠️ <b>Не удалось подтвердить найденные новости.</b>\n\n"
+                "Бот проверил публикации, но не получил достаточных доказательств "
+                "для безопасного вывода. Это не доказывает, что новости ложные."
+                + details
             )
 
         bot.edit_message_text(
@@ -1446,15 +1425,18 @@ def news_command(message):
         )
         return
 
+    if using_single_source:
+        selected_candidates = single_source_candidates
+    else:
+        selected_candidates = verified_candidates
+
     # ========================================================
     # ФИНАЛЬНАЯ СОРТИРОВКА
     # ========================================================
 
-    verified_candidates = sort_candidates(
-        verified_candidates
-    )
+    selected_candidates = sort_candidates(selected_candidates)
 
-    top_news = verified_candidates[:3]
+    top_news = selected_candidates[:3]
 
     # ========================================================
     # ФОРМИРУЕМ КОМПАКТНЫЙ ОТВЕТ
@@ -1462,9 +1444,10 @@ def news_command(message):
 
     output = []
 
-    output.append(
-        "🧂 <b>МАРИНАД | РЕДАКЦИОННЫЙ ОТБОР</b>"
-    )
+    output.append("🧂 <b>МАРИНАД | РЕДАКЦИОННЫЙ ОТБОР</b>")
+    if using_single_source:
+        output.append("⚠️ <b>Режим одного источника</b>")
+        output.append("Независимое подтверждение не найдено. Проверяй материал перед публикацией.")
 
     output.append("")
 
@@ -1514,12 +1497,12 @@ def news_command(message):
             f"📊 Рейтинг: {item['score']}/10"
         )
 
-        output.append(
-            "✅ <b>Подтверждено вторым источником</b>"
-        )
-
-        if item["secondary_source"]:
-            output.append(f"↳ {safe_secondary_source}")
+        if item.get("single_source"):
+            output.append("⚠️ <b>Один доверенный источник · без независимого подтверждения</b>")
+        else:
+            output.append("✅ <b>Подтверждено вторым источником</b>")
+            if item.get("secondary_source"):
+                output.append(f"↳ {safe_secondary_source}")
 
         safe_url = html.escape(item["url"], quote=True)
         output.append(f"🔗 {safe_url}")
@@ -1529,10 +1512,10 @@ def news_command(message):
 
         output.append("")
 
-    output.append(
-        "🔒 <i>Старые, англоязычные и "
-        "непрошедшие проверку материалы отфильтрованы.</i>"
-    )
+    if using_single_source:
+        output.append("⚠️ <i>Эти материалы прошли проверку исходной публикации, но независимое подтверждение не найдено. Не публикуй их как подтверждённые несколькими источниками.</i>")
+    else:
+        output.append("🔒 <i>Старые, англоязычные и непрошедшие проверку материалы отфильтрованы.</i>")
 
     final_text = "\n".join(
         output
